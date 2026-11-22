@@ -7,10 +7,13 @@ from concurrent.futures import as_completed as real_as_completed
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 import requests_mock
 
 from importlib import import_module
+from physionet.api.client import PhysioNetClient
 from physionet.cli import main
+from physionet.api.exceptions import PhysioNetAPIError
 from physionet.download import (
     MAX_JOBS,
     DownloadError,
@@ -70,7 +73,14 @@ def local_server():
     import json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    state = {"files": {}, "on_file": lambda path: None}
+    state = {
+        "files": {},
+        "on_file": lambda path: None,
+        "manifest_statuses": [],
+        "manifest_requests": 0,
+        "version_statuses": [],
+        "version_requests": 0,
+    }
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -89,9 +99,15 @@ def local_server():
             files = state["files"]
             prefix = "/files/demo/1.0/"
             if self.path == "/api/v1/projects/demo/versions/":
-                self.send_body(json.dumps(VERSIONS).encode(), "application/json")
+                state["version_requests"] += 1
+                statuses = state["version_statuses"]
+                status = statuses.pop(0) if statuses else 200
+                self.send_body(json.dumps(VERSIONS).encode(), "application/json", status=status)
             elif self.path == prefix + "SHA256SUMS.txt":
-                self.send_body(manifest_for(files).encode(), "text/plain")
+                state["manifest_requests"] += 1
+                statuses = state["manifest_statuses"]
+                status = statuses.pop(0) if statuses else 200
+                self.send_body(manifest_for(files).encode(), "text/plain", status=status)
             elif self.path.startswith(prefix) and self.path[len(prefix):] in files:
                 path = self.path[len(prefix):]
                 state["on_file"](path)
@@ -139,6 +155,75 @@ def test_parallel_download_really_runs_files_at_once(tmp_path, local_server):
     for path, body in state["files"].items():
         assert (dest / path).read_bytes() == body
     assert download_threads() == []
+
+
+def test_manifest_retries_transient_status(tmp_path, local_server):
+    base_url, state = local_server
+    state["files"] = {"data.csv": b"manifest retry"}
+    state["manifest_statuses"] = [503]
+
+    dest = download("demo", version="1.0", output_dir=str(tmp_path), base_url=base_url, retries=1)
+
+    assert (dest / "data.csv").read_bytes() == b"manifest retry"
+    assert state["manifest_requests"] == 2
+
+
+def test_manifest_retries_zero_makes_one_request(tmp_path, local_server):
+    base_url, state = local_server
+    state["files"] = {"data.csv": b"manifest retry"}
+    state["manifest_statuses"] = [503, 200]
+
+    with pytest.raises(requests.HTTPError, match="503"):
+        download("demo", version="1.0", output_dir=str(tmp_path), base_url=base_url, retries=0)
+
+    assert state["manifest_requests"] == 1
+
+
+def test_manifest_exhausted_retries_exposes_final_status(tmp_path, local_server):
+    base_url, state = local_server
+    state["files"] = {"data.csv": b"manifest retry"}
+    state["manifest_statuses"] = [503, 503]
+
+    with pytest.raises(requests.HTTPError, match="503"):
+        download("demo", version="1.0", output_dir=str(tmp_path), base_url=base_url, retries=1)
+
+    assert state["manifest_requests"] == 2
+
+
+def test_version_list_retries_transient_status(tmp_path, local_server):
+    base_url, state = local_server
+    state["files"] = {"data.csv": b"version retry"}
+    state["version_statuses"] = [503]
+
+    dest = download("demo", version="1.0", output_dir=str(tmp_path), base_url=base_url, retries=1)
+
+    assert (dest / "data.csv").read_bytes() == b"version retry"
+    assert state["version_requests"] == 2
+
+
+def test_list_versions_retries_transient_status_directly(local_server):
+    base_url, state = local_server
+    state["version_statuses"] = [503]
+    client = PhysioNetClient(base_url=base_url)
+
+    try:
+        versions = client.projects.list_versions("demo")
+    finally:
+        client.close()
+
+    assert versions[0].version == "1.0"
+    assert state["version_requests"] == 2
+
+
+def test_version_list_retries_zero_makes_one_request(tmp_path, local_server):
+    base_url, state = local_server
+    state["files"] = {"data.csv": b"version retry"}
+    state["version_statuses"] = [503, 200]
+
+    with pytest.raises(PhysioNetAPIError, match="HTTP 503"):
+        download("demo", version="1.0", output_dir=str(tmp_path), base_url=base_url, retries=0)
+
+    assert state["version_requests"] == 1
 
 
 def test_parallel_failures_keep_other_files_and_are_in_manifest_order(tmp_path, capsys):

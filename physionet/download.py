@@ -13,12 +13,12 @@ from typing import List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from tqdm import tqdm
-from urllib3.util.retry import Retry
 
 from physionet.api.client import PhysioNetClient
 from physionet.api.exceptions import ForbiddenError, NotFoundError
 from physionet.api.utils import format_size
 from physionet.auth import resolve_credentials
+from physionet.retry import configure_retry_adapter
 
 S3_BASE_URL = "https://physionet-open.s3.amazonaws.com"
 S3_BUCKET = "physionet-open"
@@ -156,11 +156,11 @@ def download(
 
     try:
         # Resolve version
-        version = _resolve_version(client, slug, version)
+        version = _resolve_version(client, slug, version, retries=retries)
 
         # Get file manifest
         try:
-            files = _get_file_manifest(client, slug, version)
+            files = _get_file_manifest(client, slug, version, retries=retries)
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code in (401, 403):
                 raise ForbiddenError(
@@ -378,9 +378,11 @@ def _download_in_parallel(files, fetch, record, report_failure, jobs: int, sourc
         progress.close()
 
 
-def _resolve_version(client: PhysioNetClient, slug: str, version: Optional[str]) -> str:
+def _resolve_version(
+    client: PhysioNetClient, slug: str, version: Optional[str], retries: int = 3
+) -> str:
     """Resolve the version to download, defaulting to the latest."""
-    versions = client.projects.list_versions(slug)
+    versions = client.projects.list_versions(slug, retries=retries)
 
     if not versions:
         raise NotFoundError(f"No versions found for project '{slug}'")
@@ -397,7 +399,9 @@ def _resolve_version(client: PhysioNetClient, slug: str, version: Optional[str])
     return version
 
 
-def _get_file_manifest(client: PhysioNetClient, slug: str, version: str) -> List[Tuple[str, str]]:
+def _get_file_manifest(
+    client: PhysioNetClient, slug: str, version: str, retries: int = 3
+) -> List[Tuple[str, str]]:
     """
     Get the file manifest from SHA256SUMS.txt.
 
@@ -407,10 +411,15 @@ def _get_file_manifest(client: PhysioNetClient, slug: str, version: str) -> List
     Returns:
         List of (filepath, sha256_hash) tuples
     """
-    url = f"{client.base_url}/files/{slug}/{version}/SHA256SUMS.txt"
+    prefix = f"{client.base_url}/files/{slug}/{version}/"
+    _configure_retry_adapter(client.session, prefix, retries, adapter_prefix=prefix)
+    url = f"{prefix}SHA256SUMS.txt"
     response = client.session.get(url, timeout=client.timeout)
-    response.raise_for_status()
-    return _parse_manifest(response.text)
+    try:
+        response.raise_for_status()
+        return _parse_manifest(response.text)
+    finally:
+        response.close()
 
 
 def _parse_manifest(text: str) -> List[Tuple[str, str]]:
@@ -673,56 +682,30 @@ def _configure_retry_adapter(
     url: str,
     retries: int,
     adapter_prefix: Optional[str] = None,
+    cache_attr: str = _DOWNLOAD_ADAPTER_CACHE_ATTR,
 ) -> Optional[HTTPAdapter]:
-    """Mount and cache a retry adapter scoped to the download URL.
+    """Mount and cache a retry adapter scoped to a URL prefix.
 
     The default adapters belong to the whole session and may also be used by
-    API requests. A dedicated adapter keeps the download retry policy and
-    connection pool separate from those shared adapters.
+    other requests. A dedicated adapter keeps this retry policy and connection
+    pool separate from those shared adapters.
 
     A more-specific adapter supplied by the caller remains selected by
-    ``requests``. Only the dataset prefix is mounted, so downloads do not add
-    one adapter entry per file.
+    ``requests``. Only the requested prefix is mounted, so repeated requests
+    do not add one adapter entry per URL.
 
     ``retries=0`` leaves caller-provided adapters unchanged. If a dedicated
     adapter was cached by an earlier download, its policy is reset to
     ``Retry(0, read=False)`` so a later download on the same session does not
     keep retrying.
     """
-    prefix = (adapter_prefix or _download_adapter_prefix(url)).rstrip("/") + "/"
-    cache = getattr(session, _DOWNLOAD_ADAPTER_CACHE_ATTR, None)
-    if retries <= 0:
-        if isinstance(cache, dict):
-            adapter = cache.get(prefix)
-            if isinstance(adapter, HTTPAdapter):
-                adapter.max_retries = Retry(total=0, read=False)
-        return None
-
-    if not isinstance(cache, dict):
-        cache = {}
-        setattr(session, _DOWNLOAD_ADAPTER_CACHE_ATTR, cache)
-
-    adapter = cache.get(prefix)
-    if adapter is None:
-        adapter = HTTPAdapter(
-            max_retries=Retry(
-                total=retries,
-                backoff_factor=1,
-                status_forcelist=[502, 503, 504],
-            )
-        )
-        cache[prefix] = adapter
-        session.mount(prefix, adapter)
-    else:
-        # The adapter is dedicated to this download prefix, so changing its
-        # policy does not modify a shared adapter or discard its pool.
-        adapter.max_retries = Retry(
-            total=retries,
-            backoff_factor=1,
-            status_forcelist=[502, 503, 504],
-        )
-
-    return adapter
+    return configure_retry_adapter(
+        session,
+        url,
+        retries,
+        adapter_prefix=adapter_prefix or _download_adapter_prefix(url),
+        cache_attr=cache_attr,
+    )
 
 
 def _download_adapter_prefix(url: str) -> str:

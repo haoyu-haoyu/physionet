@@ -33,6 +33,7 @@ from physionet.api.client import PhysioNetClient
 from physionet.api.exceptions import ForbiddenError, NotFoundError
 from physionet.auth import resolve_credentials
 from physionet.download import (
+    _configure_retry_adapter,
     _download_file,
     _download_file_s3,
     _get_file_manifest,
@@ -222,12 +223,12 @@ def _fetch(
     """Return the cached file for the one candidate path the project has."""
     _check_name(slug, "project")
     if version is None:
-        version = _latest_version(remote, slug)
+        version = _latest_version(remote, slug, retries=retries)
     _check_name(version, "version")
 
     cache = get_cache_dir(cache_dir)
     origin = _origin_folder(remote.base_url)
-    manifest, restricted = _manifest(remote, cache, origin, slug, version)
+    manifest, restricted = _manifest(remote, cache, origin, slug, version, retries=retries)
     name, expected_hash = _choose(manifest, requested, candidates, slug, version)
     if tables_only and _reader_for(name) is None:
         raise ValueError(
@@ -278,9 +279,9 @@ def _fetch(
     return target
 
 
-def _latest_version(remote: _Remote, slug: str) -> str:
+def _latest_version(remote: _Remote, slug: str, retries: int = 3) -> str:
     try:
-        return _resolve_version(remote.client, slug, None)
+        return _resolve_version(remote.client, slug, None, retries=retries)
     except (requests.ConnectionError, requests.Timeout) as exc:
         raise ConnectionError(
             f"Could not reach PhysioNet to find the latest version of {slug}. "
@@ -288,22 +289,29 @@ def _latest_version(remote: _Remote, slug: str) -> str:
         ) from None
 
 
-def _download_manifest(remote: _Remote, slug: str, version: str) -> Tuple[List[Tuple[str, str]], bool]:
+def _download_manifest(
+    remote: _Remote, slug: str, version: str, retries: int = 3
+) -> Tuple[List[Tuple[str, str]], bool]:
     """
     Return the checksum list and whether the project is restricted.
 
     The list is first requested without credentials: if that works, the
     project is open. Only if it is refused are credentials used.
     """
+    prefix = f"{remote.client.base_url}/files/{slug}/{version}/"
+    _configure_retry_adapter(remote.client.session, prefix, retries, adapter_prefix=prefix)
     if remote.has_credentials:
-        url = f"{remote.client.base_url}/files/{slug}/{version}/SHA256SUMS.txt"
+        url = f"{prefix}SHA256SUMS.txt"
         response = remote.client.session.get(url, timeout=remote.client.timeout, auth=_without_credentials)
-        if response.status_code == 200:
-            return _parse_manifest(response.text), False
-        if response.status_code not in (401, 403):
-            response.raise_for_status()
-        return _get_file_manifest(remote.client, slug, version), True
-    return _get_file_manifest(remote.client, slug, version), False
+        try:
+            if response.status_code == 200:
+                return _parse_manifest(response.text), False
+            if response.status_code not in (401, 403):
+                response.raise_for_status()
+        finally:
+            response.close()
+        return _get_file_manifest(remote.client, slug, version, retries=retries), True
+    return _get_file_manifest(remote.client, slug, version, retries=retries), False
 
 
 def _without_credentials(request):
@@ -312,7 +320,12 @@ def _without_credentials(request):
 
 
 def _manifest(
-    remote: _Remote, cache: Path, origin: str, slug: str, version: str
+    remote: _Remote,
+    cache: Path,
+    origin: str,
+    slug: str,
+    version: str,
+    retries: int = 3,
 ) -> Tuple[Dict[str, str], Optional[bool]]:
     """
     Return {path: sha256} for a project version, caching the checksum list,
@@ -330,7 +343,7 @@ def _manifest(
             restricted = None
     else:
         try:
-            entries, restricted = _download_manifest(remote, slug, version)
+            entries, restricted = _download_manifest(remote, slug, version, retries=retries)
         except (requests.ConnectionError, requests.Timeout) as exc:
             raise ConnectionError(
                 f"Could not reach PhysioNet to get the file list for {slug} {version}, and it is "

@@ -22,6 +22,7 @@ from physionet.download import (
     _select_source,
     _download_file,
     _download_file_s3,
+    _get_file_manifest,
     _verify_checksum,
     _resolve_version,
     S3_BASE_URL,
@@ -190,6 +191,46 @@ class TestVerifyChecksum:
 
 
 class TestResolveVersion:
+    def test_version_retry_adapter_is_scoped_to_versions_endpoint(self):
+        client = PhysioNetClient(base_url="https://example.com")
+        api_url = "https://example.com/api/v1/projects/demo/versions/"
+        file_url = "https://example.com/files/demo/1.0/data.csv"
+        default_adapter = client.session.get_adapter("https://")
+
+        try:
+            with rm.Mocker() as mock:
+                mock.get(
+                    api_url,
+                    json=[{"slug": "demo", "title": "Demo", "version": "1.0", "abstract": "", "citation": ""}],
+                )
+                assert _resolve_version(client, "demo", "1.0", retries=2) == "1.0"
+        finally:
+            client.close()
+
+        version_adapter = client.session.get_adapter(api_url)
+        assert version_adapter is not default_adapter
+        assert version_adapter.max_retries.total == 2
+        assert version_adapter.max_retries.raise_on_status is False
+        assert client.session.get_adapter(file_url) is default_adapter
+
+    def test_version_retries_zero_leaves_default_adapter_unchanged(self):
+        client = PhysioNetClient(base_url="https://example.com")
+        api_url = "https://example.com/api/v1/projects/demo/versions/"
+        default_adapter = client.session.get_adapter("https://")
+
+        try:
+            with rm.Mocker() as mock:
+                mock.get(
+                    api_url,
+                    json=[{"slug": "demo", "title": "Demo", "version": "1.0", "abstract": "", "citation": ""}],
+                )
+                assert _resolve_version(client, "demo", "1.0", retries=0) == "1.0"
+        finally:
+            client.close()
+
+        assert client.session.get_adapter(api_url) is default_adapter
+        assert not hasattr(client.session, "_physionet_version_adapters")
+
     def test_latest_version(self):
         client = MagicMock()
         v1 = MagicMock(version="1.0")
@@ -625,6 +666,52 @@ class TestDownload:
         captured = capsys.readouterr()
         assert "file.csv" in captured.out
         assert "demo v1.0" in captured.out
+
+    def test_manifest_and_file_share_the_download_adapter(self, tmp_path):
+        content = b"file content"
+        manifest = self._make_manifest([("data.csv", content)])
+        prefix = "https://example.com/files/demo/1.0/"
+        client = PhysioNetClient(base_url="https://example.com")
+
+        try:
+            with rm.Mocker() as mock:
+                mock.get(f"{prefix}SHA256SUMS.txt", text=manifest)
+                mock.get(f"{prefix}data.csv", content=content)
+                _get_file_manifest(client, "demo", "1.0", retries=3)
+                manifest_adapter = client.session.get_adapter(f"{prefix}SHA256SUMS.txt")
+                destination = tmp_path / "data.csv"
+                _download_file(
+                    f"{prefix}data.csv",
+                    destination,
+                    hashlib.sha256(content).hexdigest(),
+                    client.session,
+                    retries=3,
+                    adapter_prefix=prefix,
+                )
+        finally:
+            client.close()
+
+        assert client.session.get_adapter(f"{prefix}data.csv") is manifest_adapter
+        assert destination.read_bytes() == content
+
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_manifest_response_is_closed(self, failed):
+        client = MagicMock()
+        client.base_url = "https://example.com"
+        client.timeout = 5
+        response = MagicMock()
+        response.text = "abc  file.txt\n"
+        client.session.get.return_value = response
+        if failed:
+            response.raise_for_status.side_effect = requests.HTTPError("503", response=response)
+
+        if failed:
+            with pytest.raises(requests.HTTPError, match="503"):
+                _get_file_manifest(client, "demo", "1.0", retries=0)
+        else:
+            assert _get_file_manifest(client, "demo", "1.0", retries=0) == [("file.txt", "abc")]
+
+        response.close.assert_called_once()
 
     def test_download_from_another_server_never_uses_the_mirror(self, tmp_path):
         file_content = b"staging data"
